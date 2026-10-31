@@ -304,3 +304,13 @@ input[type=range] { accent-color: var(--accent); }
     #toasts { left: 15px; right: 15px; top: calc(10px + env(safe-area-inset-top, 0px)); }
     .toast { max-width: none; }
 }
+
+/* === Panel de etiquetas bajo el audio === */
+.tag-panel { margin-top: 20px; }
+.tag-toolbar { margin: 12px 0; }
+.tag-panel .chips { max-height: 320px; overflow-y: auto; display: flex; flex-wrap: wrap; gap: 8px; }
+.chip-wrap { display: inline-flex; align-items: center; gap: 4px; }
+.chip-play { width: 28px; height: 28px; border-radius: 50%; border: 1px solid rgba(255,255,255,.15); background: rgba(255,255,255,.06); color: inherit; cursor: pointer; font-size: .7rem; }
+.chip-play.playing { background: var(--accent); }
+.audio-item audio { width: 100%; margin-top: 8px; }
+@media (min-width: 900px) { .tag-panel { position: sticky; top: 20px; } }

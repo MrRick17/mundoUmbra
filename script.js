@@ -83,7 +83,8 @@ const state = {
     current: null,
     view: "dashboard",
     dirty: false,
-    playingId: null
+    playingId: null,
+    renderedId: null
 };
 
 let settings = loadSettings();
@@ -695,6 +696,7 @@ const deleteProject = guard(async (id) => {
 
     if (state.current && state.current.id === id) {
         state.current = null;
+        state.renderedId = null;
         state.dirty = false;
         try { localStorage.removeItem(LAST_PROJECT_KEY); } catch { /* ignorar */ }
     }
@@ -714,7 +716,8 @@ function renderEditorSelect() {
 }
 
 function ensureEditor() {
-    if (state.current) { renderEditor(); return; }
+    // No re-renderizar si ya está dibujado: conserva guion sin guardar y los audios en reproducción
+    if (state.current) { if (state.renderedId !== state.current.id) renderEditor(); return; }
     let id = null;
     try { id = localStorage.getItem(LAST_PROJECT_KEY); } catch { /* ignorar */ }
     if (!id || !state.projects.some(p => p.id === id)) id = state.projects[0] ? state.projects[0].id : null;
@@ -731,6 +734,7 @@ const openProject = guard(async (id, goEditor = true) => {
     }
     state.current = normProject(id, snap.data());
     state.dirty = false;
+    state.renderedId = null;
     try { localStorage.setItem(LAST_PROJECT_KEY, id); } catch { /* ignorar */ }
     if (goEditor) showView("editor");
     else renderEditor();
@@ -742,6 +746,7 @@ function renderEditor() {
     $("#editor-body").hidden = !p;
     $("#editor-title").textContent = p ? `Estudio: ${p.titulo}` : "Estudio de Grabación";
     if (!p) return;
+    state.renderedId = p.id;
 
     renderEditorSelect();
     $("#wpm-input").value = settings.wpm;
@@ -772,10 +777,37 @@ function updateScriptStats() {
 function renderTagChips() {
     const box = $("#tag-chips");
     if (!box) return;
-    const chips = state.songs.map(s =>
-        `<button type="button" class="chip" data-tag="${esc(s.identificador)}" title="${esc(s.titulo)}">${esc(s.identificador)}</button>`);
-    chips.push(`<button type="button" class="chip" data-tag="[BGM-STOP]" title="Corta la música">[BGM-STOP]</button>`);
+    const q = ($("#tag-search") ? $("#tag-search").value : "").trim().toLowerCase();
+    const amb = $("#tag-filter") ? $("#tag-filter").value : "all";
+    const chips = state.songs
+        .filter(s => (amb === "all" || s.ambiente === amb) && (!q || (s.identificador + " " + s.titulo).toLowerCase().includes(q)))
+        .map(s => `<span class="chip-wrap">
+            <button type="button" class="chip-play" data-action="play-song" data-id="${esc(s.id)}" title="Previsualizar pista"><i class="fa-solid fa-play"></i></button>
+            <button type="button" class="chip" data-tag="${esc(s.identificador)}" title="${esc(s.titulo)} · ${esc(s.ambiente)}">${esc(s.identificador)}</button>
+        </span>`);
+    chips.push(`<span class="chip-wrap"><button type="button" class="chip" data-tag="[BGM-STOP]" title="Corta la música">[BGM-STOP]</button></span>`);
     box.innerHTML = chips.join("");
+    refreshPlayButtons();
+}
+
+// Ubica el cursor en el guion según el minuto actual del audio (estimado por palabras/min)
+function locateAudioPoint() {
+    const el = lastVoiceEl;
+    if (!el) { toast("Reproduce o mueve un audio primero", "error"); return; }
+    const ta = $("#script-textarea");
+    const target = Math.round((el.currentTime / 60) * getWpm());
+    const re = /\S+/g;
+    const isTag = /^\[(?:BGM|SFX)-[^\]\s]+\]$/i;
+    let m, n = 0, pos = ta.value.length;
+    while ((m = re.exec(ta.value))) {
+        if (isTag.test(m[0])) continue;
+        if (n >= target) { pos = m.index; break; }
+        n++;
+    }
+    ta.focus();
+    ta.setSelectionRange(pos, pos);
+    ta.scrollTop = Math.max(0, (pos / Math.max(1, ta.value.length)) * ta.scrollHeight - ta.clientHeight / 2);
+    toast(`Punto estimado: palabra ${target} (${fmtDur(el.currentTime)})`);
 }
 
 function insertAtCursor(ta, text) {
@@ -909,22 +941,60 @@ const analyzeScript = guard(async () => {
 });
 
 /* ---- Audios locutados ---- */
+/* Los <audio> se crean una sola vez y se reutilizan: pausar/cambiar de pestaña no los reinicia */
+const audioEls = new Map();
+let lastVoiceEl = null;
+const POS_KEY = "scm_audio_pos_";
+
+function getAudioEl(a) {
+    let el = audioEls.get(a.path);
+    if (el) return el;
+    el = document.createElement("audio");
+    el.controls = true;
+    el.preload = "metadata";
+    el.src = a.url;
+
+    const savePos = () => { try { localStorage.setItem(POS_KEY + a.path, String(el.currentTime)); } catch { /* ignorar */ } };
+    let saved = 0;
+    try { saved = Number(localStorage.getItem(POS_KEY + a.path)) || 0; } catch { /* ignorar */ }
+    if (saved) el.addEventListener("loadedmetadata", () => { if (el.duration > saved) el.currentTime = saved; }, { once: true });
+
+    let lastSave = 0;
+    el.addEventListener("timeupdate", () => {
+        const now = Date.now();
+        if (now - lastSave > 1500) { lastSave = now; savePos(); }
+    });
+    el.addEventListener("pause", savePos);
+    el.addEventListener("seeked", () => { lastVoiceEl = el; savePos(); });
+    el.addEventListener("play", () => {
+        lastVoiceEl = el;
+        audioEls.forEach(o => { if (o !== el) o.pause(); });
+    });
+    el.addEventListener("ended", () => { try { localStorage.removeItem(POS_KEY + a.path); } catch { /* ignorar */ } });
+
+    audioEls.set(a.path, el);
+    return el;
+}
+
 function renderAudios() {
     const box = $("#project-audios-list");
     const audios = state.current ? state.current.audios : [];
+    box.textContent = "";
     if (!audios.length) {
         box.innerHTML = '<p class="helper-text">Aún no hay audios en este proyecto.</p>';
         return;
     }
-    box.innerHTML = audios.map(a => `
-        <div class="audio-item">
-            <div class="row">
+    audios.forEach(a => {
+        const item = document.createElement("div");
+        item.className = "audio-item";
+        item.innerHTML = `<div class="row">
                 <span><i class="fa-solid fa-microphone-lines"></i> ${esc(a.nombre)}
                     ${a.duracion ? `<small style="color:var(--text-muted)">· ${esc(fmtDur(a.duracion))}</small>` : ""}</span>
                 <button class="delete-icon" data-action="delete-audio" data-path="${esc(a.path)}" title="Eliminar audio"><i class="fa-solid fa-trash"></i></button>
-            </div>
-            <audio controls preload="none" src="${esc(a.url)}"></audio>
-        </div>`).join("");
+            </div>`;
+        item.appendChild(getAudioEl(a));
+        box.appendChild(item);
+    });
 }
 
 const uploadVoice = guard(async (file) => {
@@ -976,6 +1046,8 @@ const deleteAudio = guard(async (path) => {
     // Solo se borra de Firestore para no complicar la gestión sin backend
     await updateDoc(doc(db, "Proyectos", p.id), { audios_vinculados: rest, actualizado: Date.now() });
     p.audios = rest;
+    const gone = audioEls.get(path);
+    if (gone) { gone.pause(); audioEls.delete(path); }
     renderAudios();
     toast("Audio eliminado");
     await loadProjects();
@@ -1085,7 +1157,7 @@ function applyMusicFilter() {
 }
 
 function refreshPlayButtons() {
-    $$('#music-library-list [data-action="play-song"]').forEach(btn => {
+    $$('[data-action="play-song"]').forEach(btn => {
         const active = btn.dataset.id === state.playingId && !player.paused;
         btn.classList.toggle("playing", active);
         btn.innerHTML = `<i class="fa-solid ${active ? "fa-pause" : "fa-play"}"></i>`;
@@ -1104,7 +1176,17 @@ function togglePlay(id) {
         state.playingId = id;
     }
     player.volume = Math.min(1, Math.max(0, s.volumen / 100));
-    player.play().catch(() => toast("No se pudo reproducir la pista", "error"));
+    player.play().catch((err) => {
+        if (err && err.name === "AbortError") return; // el clic en otra pista canceló esta carga: no es un fallo
+        const code = player.error ? player.error.code : 0;
+        const why = code === 4 ? "el archivo no existe, está bloqueado o su formato no es compatible"
+            : code === 2 ? "falló la red al descargarlo"
+            : code === 3 ? "el archivo está dañado"
+            : err && err.name === "NotAllowedError" ? "el navegador bloqueó la reproducción"
+            : (err && err.message) || "motivo desconocido";
+        console.error("Error de audio:", s.url, player.error, err);
+        toast(`No se pudo reproducir ${s.identificador}: ${why}`, "error");
+    });
 }
 
 const saveSong = guard(async (id) => {
@@ -1315,6 +1397,11 @@ function bindStaticListeners() {
     });
     $("#btn-save-script").addEventListener("click", saveScript);
     $("#btn-analyze").addEventListener("click", analyzeScript);
+    $("#btn-locate").addEventListener("click", locateAudioPoint);
+    $("#tag-filter").innerHTML = '<option value="all">Todos</option>' +
+        AMBIENTES.map(a => `<option value="${esc(a)}">${esc(a)}</option>`).join("");
+    $("#tag-search").addEventListener("input", renderTagChips);
+    $("#tag-filter").addEventListener("change", renderTagChips);
     $("#editor-project-select").addEventListener("change", (e) => {
         const target = e.target.value;
         if (state.dirty && !confirm("Tienes cambios sin guardar en el guion. ¿Cambiar de proyecto igualmente?")) {
